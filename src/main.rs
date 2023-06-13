@@ -1,12 +1,12 @@
 use clap::Parser;
 use color_eyre::{
-    eyre::{eyre, ContextCompat},
+    eyre::{eyre, Context, ContextCompat},
     Result,
 };
 use ignore::WalkBuilder;
 use indicatif::ProgressBar;
 use reqwest::{
-    header::{self, AUTHORIZATION},
+    header::{HeaderMap, AUTHORIZATION},
     Client,
 };
 use serde::{Deserialize, Serialize};
@@ -14,35 +14,31 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use tiktoken_rs::get_completion_max_tokens;
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct Request {
     model: &'static str,
-    messages: Vec<Message>,
+    prompt: String,
+    max_tokens: usize,
+    temperature: f32,
 }
 
 #[derive(Debug, Deserialize)]
-struct Response {
-    choices: Vec<Choice>,
+#[serde(untagged)]
+enum Response {
+    Ok { choices: Vec<Choice> },
+    Err { error: Error },
+}
+
+#[derive(Debug, Deserialize)]
+struct Error {
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct Choice {
-    message: Message,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum Role {
-    Assistant,
-    System,
-    User,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct Message {
-    role: Role,
-    content: String,
+    text: String,
 }
 
 #[derive(Parser, Debug)]
@@ -62,50 +58,52 @@ async fn convert(
     client: &Client,
 ) -> Result<()> {
     let content = fs::read_to_string(source_file_path)?;
+    let model = "text-davinci-003";
+    let prompt = format!("#Java to PHP:\nJava:\n{}\n\nPHP:", content);
+    let max_tokens = get_completion_max_tokens(model, &prompt).map_err(|e| eyre!(e))?;
 
     let request = Request {
-        model: "gpt-3.5-turbo",
-        messages: vec![
-            Message {
-                role: Role::System,
-                content: "You are a java to php converter".into(),
-            },
-            Message {
-                role: Role::User,
-                content,
-            },
-        ],
+        model,
+        prompt,
+        max_tokens,
+        temperature: 0.,
     };
 
     let response = client
-        .post("https://api.openai.com/v1/chat/completions")
+        .post("https://api.openai.com/v1/completions")
         .json(&request)
         .send()
         .await?
         .json::<Response>()
         .await?;
 
-    let content = &response
-        .choices
+    let choices = match response {
+        Response::Ok { choices } => choices,
+        Response::Err { error } => return Err(eyre!("{}", error.message)),
+    };
+
+    let new_content = choices
         .first()
         .wrap_err("No choice received")?
-        .message
-        .content;
+        .text
+        .as_str();
 
-    fs::write(&destination_file_path, content)?;
+    fs::write(&destination_file_path, new_content)?;
 
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    color_eyre::install()?;
+
     let Args {
         source,
         destination,
         api_key,
     } = Args::parse();
 
-    let mut headers = header::HeaderMap::new();
+    let mut headers = HeaderMap::new();
     headers.insert(AUTHORIZATION, format!("Bearer {}", api_key).parse()?);
 
     let client = Client::builder().default_headers(headers).build()?;
@@ -150,11 +148,15 @@ async fn main() -> Result<()> {
             let client = client.clone();
 
             let handle = tokio::spawn(async move {
-                convert(path, new_path, &client).await?;
+                let result = convert(path, &new_path, &client)
+                    .await
+                    .wrap_err_with(|| eyre!("{}", new_path.display()));
+
+                if let Err(e) = result {
+                    bar.println(format!("{:#}", e));
+                }
 
                 bar.inc(1);
-
-                Ok(()) as Result<_>
             });
 
             handles.push(handle);
@@ -166,9 +168,7 @@ async fn main() -> Result<()> {
     bar.set_length(handles.len() as _);
 
     for handle in handles {
-        if let Err(e) = handle.await? {
-            bar.println(e.to_string());
-        }
+        handle.await?;
     }
 
     bar.finish();
