@@ -15,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use tiktoken_rs::get_completion_max_tokens;
+use tokio::task::JoinSet;
 
 #[derive(Debug, Serialize)]
 struct Request {
@@ -125,7 +126,7 @@ async fn main() -> Result<()> {
     }
 
     let bar = ProgressBar::new(0);
-    let mut handles = vec![];
+    let mut tasks = JoinSet::<Result<()>>::new();
 
     for result in WalkBuilder::new(&source)
         .filter_entry(|entry| {
@@ -144,31 +145,26 @@ async fn main() -> Result<()> {
 
         if path.is_file() {
             new_path.set_extension("php");
-            let bar = bar.clone();
             let client = client.clone();
 
-            let handle = tokio::spawn(async move {
-                let result = convert(path, &new_path, &client)
+            tasks.spawn(async move {
+                convert(path, &new_path, &client)
                     .await
-                    .wrap_err_with(|| eyre!("{}", new_path.display()));
-
-                if let Err(e) = result {
-                    bar.println(format!("{:#}", e));
-                }
-
-                bar.inc(1);
+                    .wrap_err_with(|| eyre!("{}", new_path.display()))
             });
-
-            handles.push(handle);
         } else if !new_path.exists() {
             fs::create_dir(&new_path)?;
         }
     }
 
-    bar.set_length(handles.len() as _);
+    bar.set_length(tasks.len() as u64);
 
-    for handle in handles {
-        handle.await?;
+    while let Some(result) = tasks.join_next().await.transpose()? {
+        if let Err(e) = result {
+            bar.println(format!("{:#}", e));
+        }
+
+        bar.inc(1);
     }
 
     bar.finish();
